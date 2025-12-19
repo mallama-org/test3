@@ -1,0 +1,103 @@
+name: test3-cicd
+
+on:
+  push:
+    paths:
+      - src/**
+    branches: [main]
+
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Shorten commit id
+        run: |
+          echo "COMMIT_ID=${GITHUB_SHA::6}" >> "$GITHUB_ENV"
+          
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: mallama/test3:${{ env.COMMIT_ID }}
+          
+    outputs:
+      commit_id: ${{ env.COMMIT_ID }}
+
+  cd:
+    needs: ci
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACCESS_TOKEN_GITHUB }}
+          
+      - name: Install Python tools
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y python3-pip
+            sudo ln -sf /usr/bin/python3 /usr/bin/python
+            sudo ln -sf /usr/bin/pip3 /usr/bin/pip
+
+      - name: Modify values file
+        run: |
+          echo "Updating with commit:  ${{needs.ci.outputs.commit_id}}"
+          pip install yq
+          yq -Yi '.image.tag = "${{needs.ci.outputs.commit_id}}"' charts/test3/values-dev.yaml
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Updates values.yaml with commit ${{needs.ci.outputs.commit_id}}"
+          author_name: 'GitHub Actions'
+          author_email: 'actions@github.com'
+          # Remove github_token if permissions are set at workflow level
+
+      - name: Install argocd
+        run: |
+          curl -ksSL -o argocd https://argocd-server.argocd/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv ./argocd /usr/local/bin/argocd
+
+      - name: Argocd login
+        shell: bash
+        run: |
+          argocd login argocd-server.argocd \
+            --insecure \
+            --grpc-web \
+            --username admin \
+            --password  ${{ secrets.ARGOCD_PASSWORD }}
+
+      - name: Ensure argocd repo and app
+        shell: bash
+        run: |
+
+          # Connects the argocd repo
+          repo="https://github.com/mallama-org/test3.git"
+          argocd repo list | grep -q $repo || argocd repo add $repo
+
+          # Creates the argocd app
+          argocd app get test3 || argocd app create test3 \
+            --repo $repo \
+            --path charts/test3 \
+            --dest-namespace dev \
+            --dest-server https://kubernetes.default.svc \
+            --values values-dev.yaml \
+            --revision main \
+            --sync-policy manual \
+            --sync-option CreateNamespace=true
+
+      - name: Argocd app sync
+        shell: bash
+        run: |
+          argocd app sync test3
+          argocd app wait test3 --timeout 180
